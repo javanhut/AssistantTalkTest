@@ -1,0 +1,6 @@
+["Package Info"]
+dependencies = []
+entry_file = "main.oxi"
+
+["Package Info".package]
+assistanttalktest = "0.1.0"

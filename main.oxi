@@ -1,0 +1,156 @@
+introduce os
+introduce net
+introduce json
+introduce strings
+introduce io
+
+struct Client {
+    base_url <str>
+    api_key <str>
+}
+
+struct OllamaClient(Client) {
+    model_name <str>
+}
+
+OllamaClient includes {
+    fun chat(messages <array>, voice <OllamaClient>) {
+        tag <str> = "/api/chat"
+        // think=False: ornith otherwise spends ~4s on hidden reasoning before the first word
+        body := {"model": self.model_name, "think": False, "messages": messages}
+        total_url <str> := self.base_url + tag
+        ollama_stream := net.open_stream(url=total_url, method="POST", body=json.stringify(body))
+        done <bool> := False
+        reply <str> := ""
+        pending <str> := ""
+        repeat unless done {
+            line := net.read_line(ollama_stream)
+            option {
+                line == "" -> {
+                    done = True
+                }
+                {
+                    obj := json.parse(line)
+                    message := obj.message.content
+                    print(message)
+                    reply = reply + message
+                    pending = pending + message
+                    cut := sentence_end(pending)
+                    repeat unless cut < 0 {
+                        voice.speak(strings.slice(pending, 0, cut + 1))
+                        pending = strings.slice(pending, cut + 1, len(pending))
+                        cut = sentence_end(pending)
+                    }
+                    done = obj["done"]
+                }
+            }
+        }
+        net.close(ollama_stream)
+        voice.speak(pending)
+        reply
+    }
+
+    fun get_models() {
+        tag <str> := "/api/tags"
+        total_url := self.base_url + tag
+        resp := net.get(total_url)
+        body := json.parse(resp.body)
+        status_code := resp.status
+        names <array>
+        each model in body.models {
+            names = push(names, model.name)
+        }
+        names
+    }
+
+    fun queue_path() {
+        "/tmp/oxi_speech_" + str(os.pid()) + ".txt"
+    }
+
+    // Starts one background speaker that follows the queue file, where each line
+    // is a JSON speech request: it fetches the WAV and plays it, in order.
+    // Requests only travel through the file and curl's stdin, never the shell
+    // command, so model output can't inject commands.
+    fun start_speaker() {
+        option {
+            self.model_name != "phonon" -> {
+                <fail>("Not an speech model")
+            }
+            {
+                q := self.queue_path()
+                io.write_file(q, "")
+                wav := q + ".wav"
+                // a watcher polls our pid and, once we're gone (exit, Ctrl-C, kill, crash),
+                // deletes the queue and kills the loop + any playing afplay (pkill also ends the watcher)
+                os.exec("nohup sh -c '(tail -n +1 -f " + q + " | while IFS= read -r req; do printf %s \"$req\" | curl -sf --data-binary @- -H \"Content-Type: application/json\" " + self.base_url + "/v1/audio/speech -o " + wav + " && afplay " + wav + "; done) & while kill -0 " + str(os.pid()) + " 2>/dev/null; do sleep 1; done; rm -f " + q + " " + wav + "; pkill -f " + q + "' >/dev/null 2>&1 &")
+            }
+        }
+    }
+
+    fun speak(sentence <str>, voice <str> = "Zoey") {
+        text := strings.trim(strings.replace(sentence, "\n", " "))
+        option {
+            // skip empty pieces and bare list markers like "1."
+            len(strings.strip(text, "0123456789.")) > 0 -> {
+                req := {"model": self.model_name, "input": text, "voice": voice}
+                io.append_file(self.queue_path(), json.stringify(req) + "\n")
+            }
+        }
+    }
+
+}
+
+// Index of the end of the first complete sentence in s, or -1.
+// ponytail: naive split on ". ! ? newline" (cuts "Dr. Smith"); fine for speech
+fun sentence_end(s <str>) {
+    best := -1
+    each mark in [". ", "! ", "? ", "\n"] {
+        i := strings.index_of(s, mark)
+        option {
+            i >= 0 and (best < 0 or i < best) -> {
+                best = i
+            }
+        }
+    }
+    best
+}
+
+struct OllamaModel {
+    name <str>
+    message <str>
+}
+
+main {
+    model_name := "ornith-1.5:9b"
+    url := "http://localhost:11434"
+    api_key := "ollama"
+    client := OllamaClient(model_name=model_name, base_url=url, api_key=api_key)
+    voice_client := OllamaClient(model_name="phonon", base_url=url, api_key=api_key)
+    println("Available Models:", client.get_models())
+    voice_client.start_speaker()
+    exit := False
+    println("Interactive Model:")
+    output <str>
+    history <array>
+    repeat unless exit {
+        print("user >> ")
+        user_input := io.read_line()
+        option {
+            strings.lower(user_input) == "quit" or strings.lower(user_input) == "exit" -> {
+                exit = True
+            }
+            {
+                print("assistant>>")
+                history = push(history, {"role": "user", "content": user_input})
+                output = client.chat(history, voice_client)
+                history = push(history, {"role": "assistant", "content": output})
+                option {
+                    len(history) > 20 -> {
+                        history = history[len(history) - 20:]
+                    }
+                }
+                println("")
+            }
+        }
+    }
+}
